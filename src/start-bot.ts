@@ -1,144 +1,86 @@
-import { REST } from '@discordjs/rest';
-import { Options, Partials } from 'discord.js';
-import { createRequire } from 'node:module';
+/**
+ * Boot sequence.
+ *
+ * 1. Install global error handlers.
+ * 2. Connect required infrastructure (Postgres, Redis) — fail fast if unreachable.
+ * 3. Build the discord.js client and the command/component registries.
+ * 4. Wire the interaction router to gateway events.
+ * 5. Log in, and arrange a graceful shutdown.
+ */
+import type { Client } from 'discord.js';
 
-import { Button } from './buttons/index.js';
-import { DevCommand, HelpCommand, InfoCommand, TestCommand } from './commands/chat/index.js';
+import { commands, componentHandlers } from './commands/index.js';
+import { connectCache, disconnectCache } from './core/cache/index.js';
+import { createClient } from './core/client.js';
 import {
-    ChatCommandMetadata,
-    Command,
-    MessageCommandMetadata,
-    UserCommandMetadata,
-} from './commands/index.js';
-import { ViewDateSent } from './commands/message/index.js';
-import { ViewDateJoined } from './commands/user/index.js';
-import {
-    ButtonHandler,
-    CommandHandler,
-    GuildJoinHandler,
-    GuildLeaveHandler,
-    MessageHandler,
-    ReactionHandler,
-    TriggerHandler,
-} from './events/index.js';
-import { CustomClient } from './extensions/index.js';
-import { Job } from './jobs/index.js';
-import { Bot } from './models/bot.js';
-import { Reaction } from './reactions/index.js';
-import {
-    CommandRegistrationService,
-    EventDataService,
-    JobService,
-    Logger,
-} from './services/index.js';
-import { Trigger } from './triggers/index.js';
+    buildCommandRegistry,
+    buildComponentRegistry,
+    CooldownStore,
+    createInteractionRouter,
+} from './core/commands/index.js';
+import { config } from './core/config/index.js';
+import { connectDatabase, disconnectDatabase } from './core/db/index.js';
+import { installGlobalErrorHandlers, toError } from './core/errors.js';
+import { registerEvents } from './core/events/index.js';
+import { logger } from './core/logger.js';
 
-const require = createRequire(import.meta.url);
-let Config = require('../config/config.json');
-let Logs = require('../lang/logs.json');
+async function main(): Promise<void> {
+    installGlobalErrorHandlers();
+    logger.info({ env: config.nodeEnv }, 'Starting vye-bot');
 
-async function start(): Promise<void> {
-    // Services
-    let eventDataService = new EventDataService();
+    // Required infrastructure — abort boot if either is unreachable.
+    await connectDatabase();
+    await connectCache();
 
-    // Client
-    let client = new CustomClient({
-        intents: Config.client.intents,
-        partials: (Config.client.partials as string[]).map(partial => Partials[partial]),
-        makeCache: Options.cacheWithLimits({
-            // Keep default caching behavior
-            ...Options.DefaultMakeCacheSettings,
-            // Override specific options from config
-            ...Config.client.caches,
-        }),
-        enforceNonce: true,
+    const client = createClient();
+
+    const commandRegistry = buildCommandRegistry(commands);
+    const componentRegistry = buildComponentRegistry(componentHandlers);
+    const cooldowns = new CooldownStore(commands);
+    const route = createInteractionRouter({
+        commands: commandRegistry,
+        components: componentRegistry,
+        cooldowns,
     });
 
-    // Commands
-    let commands: Command[] = [
-        // Chat Commands
-        new DevCommand(),
-        new HelpCommand(),
-        new InfoCommand(),
-        new TestCommand(),
+    registerEvents(client, {
+        onReady: readyClient =>
+            logger.info(
+                { user: readyClient.user.tag, guilds: readyClient.guilds.cache.size },
+                'Gateway ready'
+            ),
+        onInteraction: route,
+    });
 
-        // Message Context Commands
-        new ViewDateSent(),
+    registerShutdown(client);
 
-        // User Context Commands
-        new ViewDateJoined(),
-
-        // TODO: Add new commands here
-    ];
-
-    // Buttons
-    let buttons: Button[] = [
-        // TODO: Add new buttons here
-    ];
-
-    // Reactions
-    let reactions: Reaction[] = [
-        // TODO: Add new reactions here
-    ];
-
-    // Triggers
-    let triggers: Trigger[] = [
-        // TODO: Add new triggers here
-    ];
-
-    // Event handlers
-    let guildJoinHandler = new GuildJoinHandler(eventDataService);
-    let guildLeaveHandler = new GuildLeaveHandler();
-    let commandHandler = new CommandHandler(commands, eventDataService);
-    let buttonHandler = new ButtonHandler(buttons, eventDataService);
-    let triggerHandler = new TriggerHandler(triggers, eventDataService);
-    let messageHandler = new MessageHandler(triggerHandler);
-    let reactionHandler = new ReactionHandler(reactions, eventDataService);
-
-    // Jobs
-    let jobs: Job[] = [
-        // TODO: Add new jobs here
-    ];
-
-    // Bot
-    let bot = new Bot(
-        Config.client.token,
-        client,
-        guildJoinHandler,
-        guildLeaveHandler,
-        messageHandler,
-        commandHandler,
-        buttonHandler,
-        reactionHandler,
-        new JobService(jobs)
-    );
-
-    // Register
-    if (process.argv[2] == 'commands') {
-        try {
-            let rest = new REST({ version: '10' }).setToken(Config.client.token);
-            let commandRegistrationService = new CommandRegistrationService(rest);
-            let localCmds = [
-                ...Object.values(ChatCommandMetadata).sort((a, b) => (a.name > b.name ? 1 : -1)),
-                ...Object.values(MessageCommandMetadata).sort((a, b) => (a.name > b.name ? 1 : -1)),
-                ...Object.values(UserCommandMetadata).sort((a, b) => (a.name > b.name ? 1 : -1)),
-            ];
-            await commandRegistrationService.process(localCmds, process.argv);
-        } catch (error) {
-            Logger.error(Logs.error.commandAction, error);
-        }
-        // Wait for any final logs to be written.
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        process.exit();
-    }
-
-    await bot.start();
+    await client.login(config.discord.token);
 }
 
-process.on('unhandledRejection', (reason, _promise) => {
-    Logger.error(Logs.error.unhandledRejection, reason);
-});
+/** Closes the gateway and infrastructure connections on SIGINT/SIGTERM. */
+function registerShutdown(client: Client): void {
+    let shuttingDown = false;
+    const shutdown = async (signal: string): Promise<void> => {
+        if (shuttingDown) {
+            return;
+        }
+        shuttingDown = true;
+        logger.info({ signal }, 'Shutting down');
+        try {
+            await client.destroy();
+            await disconnectCache();
+            await disconnectDatabase();
+        } catch (error) {
+            logger.error({ err: toError(error) }, 'Error during shutdown');
+        } finally {
+            process.exit(0);
+        }
+    };
+    process.once('SIGINT', () => void shutdown('SIGINT'));
+    process.once('SIGTERM', () => void shutdown('SIGTERM'));
+}
 
-start().catch(error => {
-    Logger.error(Logs.error.unspecified, error);
+main().catch(error => {
+    logger.fatal({ err: toError(error) }, 'Fatal error during boot');
+    process.exit(1);
 });

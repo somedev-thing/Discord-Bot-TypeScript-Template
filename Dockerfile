@@ -1,22 +1,15 @@
-FROM node:16
+FROM node:20-alpine
 
-# Create app directory
 WORKDIR /app
 
-# Copy package.json and package-lock.json
+# Install dependencies first (better layer caching).
 COPY package*.json ./
+RUN npm ci
 
-# Install packages
-RUN npm install
-
-# Copy the app code
+# Copy source and build.
 COPY . .
-
-# Build the project
 RUN npm run build
 
-# Expose ports
-EXPOSE 3001
-
-# Run the application
-CMD [ "node", "dist/start-manager.js" ]
+# Runtime config is provided via environment variables (see .env.example).
+# Postgres and Redis are required and must be reachable from the container.
+CMD [ "node", "--enable-source-maps", "dist/start-bot.js" ]
